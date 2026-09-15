@@ -24,7 +24,9 @@ jobs:
       kernel: ${{ steps.pve_repo.outputs.kernel }}
       pve_sha: ${{ steps.pve.outputs.sha }}
       t2_sha: ${{ steps.t2.outputs.sha }}
+      t2_patchset_sha: ${{ steps.t2.outputs.patchset_sha }}
       source_status: ${{ steps.pve.outputs.status }}
+      t2_review_count: ${{ steps.t2.outputs.review_count }}
 
     steps:
       - name: Checkout repository
@@ -49,12 +51,11 @@ jobs:
         if: steps.pve.outputs.status == 'pending'
         shell: bash
         env:
-          KERNEL_VERSION: ${{ steps.pve_repo.outputs.kernel }}
           PACKAGE_VERSION: ${{ steps.pve_repo.outputs.version }}
         run: |
           echo "::notice title=Proxmox source pending::${PACKAGE_VERSION} is published in APT, but the matching Git source is not available yet. T2 build skipped; the scheduled workflow will retry later."
 
-      - name: Resolve T2 patch candidate
+      - name: Resolve Macmini8,1 T2 patch candidate
         if: steps.pve.outputs.status == 'resolved'
         id: t2
         shell: bash
@@ -63,14 +64,14 @@ jobs:
         run: |
           bash scripts/resolve-t2.sh
 
-      - name: Check whether these sources are already published
+      - name: Check whether this Macmini8,1 build is already published
         if: steps.pve.outputs.status == 'resolved'
         id: candidate
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           PVE_SHA: ${{ steps.pve.outputs.sha }}
-          T2_SHA: ${{ steps.t2.outputs.sha }}
+          T2_PATCHSET_SHA: ${{ steps.t2.outputs.patchset_sha }}
           KERNEL_VERSION: ${{ steps.pve_repo.outputs.kernel }}
           PACKAGE_VERSION: ${{ steps.pve_repo.outputs.version }}
         run: |
@@ -86,7 +87,9 @@ jobs:
 
           e = os.environ
 
-          # Include the build recipe, but ignore unrelated documentation commits.
+          # Build identity deliberately uses the Macmini8,1 patchset fingerprint,
+          # not the whole upstream T2 repository SHA. Unrelated T2 changes therefore
+          # do not trigger pointless rebuilds.
           recipe = subprocess.check_output([
               'git',
               'rev-parse',
@@ -96,13 +99,12 @@ jobs:
 
           identity = '\n'.join([
               e['PVE_SHA'],
-              e['T2_SHA'],
+              e['T2_PATCHSET_SHA'],
               e['PACKAGE_VERSION'],
               recipe
           ])
 
           digest = hashlib.sha256(identity.encode()).hexdigest()
-
           tag = f"auto-{e['KERNEL_VERSION']}-pve-t2-{digest}"
 
           request = urllib.request.Request(
@@ -133,12 +135,11 @@ jobs:
 
           with open(e['GITHUB_STEP_SUMMARY'], 'a') as summary:
               summary.write(f"Candidate: `{tag}`\n\n")
-
               summary.write(
-                  'New or unpublished sources: build required.\n'
+                  'Macmini8,1 build inputs changed: build required.\n'
                   if changed
                   else
-                  'Already published: compilation and publication skipped.\n'
+                  'Exact Macmini8,1 build inputs already published: compilation skipped.\n'
               )
           PY
 
@@ -149,6 +150,7 @@ jobs:
         env:
           PVE_SHA: ${{ steps.pve.outputs.sha }}
           T2_SHA: ${{ steps.t2.outputs.sha }}
+          EXPECTED_PATCHSET_SHA: ${{ steps.t2.outputs.patchset_sha }}
         run: |
           bash scripts/validate-patches.sh
 
@@ -160,6 +162,7 @@ jobs:
           PVE_SHA: ${{ steps.pve.outputs.sha }}
           T2_SHA: ${{ steps.t2.outputs.sha }}
           EXPECTED_PATCH_COUNT: ${{ steps.compat.outputs.patch_count }}
+          EXPECTED_PATCHSET_SHA: ${{ steps.t2.outputs.patchset_sha }}
         run: |
           bash scripts/prepare-integration.sh
 
@@ -177,10 +180,6 @@ jobs:
           echo "Target:  Macmini8,1"
           echo "Kernel:  ${KERNEL_VERSION}-pve-t2"
 
-          #
-          # Free disk space on the ephemeral GitHub runner.
-          #
-
           echo "Disk space before cleanup:"
           df -h /
 
@@ -196,10 +195,6 @@ jobs:
           echo "Disk space after cleanup:"
           df -h /
 
-          #
-          # Pin both Proxmox submodules to their official sources.
-          #
-
           git -C "${PVE_DIR}" config \
             submodule.submodules/ubuntu-kernel.url \
             https://git.proxmox.com/git/mirror_ubuntu-kernels.git
@@ -207,10 +202,6 @@ jobs:
           git -C "${PVE_DIR}" config \
             submodule.submodules/zfsonlinux.url \
             https://git.proxmox.com/git/zfsonlinux.git
-
-          #
-          # Build in Debian Trixie.
-          #
 
           DOCKER_IMAGE="debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1"
 
@@ -221,7 +212,6 @@ jobs:
             "${DOCKER_IMAGE}" \
             bash -lc '
               set -euo pipefail
-
               export DEBIAN_FRONTEND=noninteractive
 
               echo "Installing Debian prerequisites..."
@@ -242,13 +232,13 @@ jobs:
                 https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg \
                 -o /usr/share/keyrings/proxmox-archive-keyring.gpg
 
-              cat > /etc/apt/sources.list.d/proxmox.sources <<EOF
+              cat > /etc/apt/sources.list.d/proxmox.sources <<EOF_APT
           Types: deb
           URIs: http://download.proxmox.com/debian/pve
           Suites: trixie
           Components: pve-no-subscription
           Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
-          EOF
+          EOF_APT
 
               apt-get update -qq
 
@@ -327,7 +317,6 @@ jobs:
               fi
 
               KERNEL_BASE="${KERNEL_MAJ}.${KERNEL_MIN}.${KERNEL_PATCHLEVEL}"
-
               BUILD_KERNEL_DIR="/workspace/proxmox-pve-kernel/proxmox-kernel-${KERNEL_BASE}/ubuntu-kernel"
 
               echo "Kernel base: ${KERNEL_BASE}"
@@ -386,11 +375,12 @@ jobs:
         if: always() && steps.pve.outputs.status == 'resolved'
         shell: bash
         run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF_SUMMARY'
           # T2 kernel workflow
 
           ## Target
           - Hardware: `Macmini8,1`
+          - Profile: `AppleSMC / thermal sensors / fan support only`
 
           ## Published Proxmox kernel
           - Repository: `pve-no-subscription`
@@ -406,15 +396,19 @@ jobs:
           - Debian changelog: `${{ steps.pve.outputs.changelog }}`
 
           ## T2 source
-          - SHA: `${{ steps.t2.outputs.sha }}`
+          - Source SHA: `${{ steps.t2.outputs.sha }}`
           - Kernel target: `${{ steps.t2.outputs.kver }}`
           - Commit: `${{ steps.t2.outputs.subject }}`
+          - Macmini8,1 patchset SHA256: `${{ steps.t2.outputs.patchset_sha }}`
+          - Allowlisted patches: `${{ steps.t2.outputs.profile_patch_count }}`
+          - Potential new patches requiring review: `${{ steps.t2.outputs.review_count }}`
+          - Review candidates: `${{ steps.t2.outputs.review_patches }}`
 
           ## Compatibility
           - Baseline compatible: `${{ steps.compat.outputs.compatible }}`
           - T2 patches applied: `${{ steps.compat.outputs.patch_count }}`
           - T2 patches skipped: `${{ steps.compat.outputs.skipped_count }}`
-          - Skipped patch: `${{ steps.compat.outputs.skipped_patch }}`
+          - Skipped patch group: `${{ steps.compat.outputs.skipped_patch }}`
           - Failed patch: `${{ steps.compat.outputs.failed_patch }}`
 
           ## Integration
@@ -424,10 +418,11 @@ jobs:
           - Kernel suffix: `${{ steps.integrate.outputs.suffix }}`
 
           ## Result
+          - Build required: `${{ steps.candidate.outputs.changed }}`
           - Kernel build: `${{ steps.build.outcome }}`
           - Package validation: `${{ steps.packages.outcome }}`
           - Artifact upload: `${{ steps.upload.outcome }}`
-          EOF
+          EOF_SUMMARY
 
   publish:
     name: Publish validated kernel prerelease
@@ -447,6 +442,7 @@ jobs:
       KERNEL_VERSION: ${{ needs.discover.outputs.kernel }}
       PVE_SHA: ${{ needs.discover.outputs.pve_sha }}
       T2_SHA: ${{ needs.discover.outputs.t2_sha }}
+      T2_PATCHSET_SHA: ${{ needs.discover.outputs.t2_patchset_sha }}
 
     steps:
       - name: Download validated packages from this run
@@ -471,40 +467,26 @@ jobs:
           import subprocess
 
           root = pathlib.Path('release-assets')
-
           files = list(root.iterdir())
 
           assert len(files) == 3 and all(
               p.is_file() for p in files
           ), 'Expected exactly three files'
 
-          kernel = list(
-              root.glob('proxmox-kernel-*-pve-t2_*.deb')
-          )
+          kernel = list(root.glob('proxmox-kernel-*-pve-t2_*.deb'))
+          headers = list(root.glob('proxmox-headers-*-pve-t2_*.deb'))
 
-          headers = list(
-              root.glob('proxmox-headers-*-pve-t2_*.deb')
-          )
-
-          assert len(kernel) == len(headers) == 1, \
-              'Expected kernel and headers'
+          assert len(kernel) == len(headers) == 1, 'Expected kernel and headers'
 
           packages = kernel + headers
-
           sums = root / 'SHA256SUMS'
-
           expected = {}
 
           for line in sums.read_text().splitlines():
               digest, name = line.split(maxsplit=1)
-
               name = pathlib.PurePosixPath(name).name
 
-              assert re.fullmatch(
-                  r'[0-9a-f]{64}',
-                  digest
-              ) and name not in expected
-
+              assert re.fullmatch(r'[0-9a-f]{64}', digest) and name not in expected
               expected[name] = digest
 
           assert set(expected) == {
@@ -519,8 +501,7 @@ jobs:
           ):
               assert hashlib.sha256(
                   p.read_bytes()
-              ).hexdigest() == expected[p.name], \
-                  'Checksum mismatch'
+              ).hexdigest() == expected[p.name], 'Checksum mismatch'
 
               name, version, arch = subprocess.check_output([
                   'dpkg-deb',
@@ -529,26 +510,11 @@ jobs:
                   str(p)
               ], text=True).split('\t')
 
-              assert name == (
-                  prefix +
-                  os.environ['KERNEL_VERSION'] +
-                  '-pve-t2'
-              )
-
+              assert name == prefix + os.environ['KERNEL_VERSION'] + '-pve-t2'
               assert arch == 'amd64'
-
               versions.append(version)
 
-          assert versions[0] == versions[1], \
-              'Kernel/header version mismatch'
-
-          #
-          # Users can run:
-          #
-          # sha256sum -c SHA256SUMS
-          #
-          # beside the downloaded packages.
-          #
+          assert versions[0] == versions[1], 'Kernel/header version mismatch'
 
           sums.write_text(
               ''.join(
@@ -559,31 +525,19 @@ jobs:
 
           e = os.environ
 
-          pathlib.Path(
-              'release-notes.md'
-          ).write_text(
-              f"Proxmox kernel "
-              f"{e['KERNEL_VERSION']}-pve-t2 "
-              f"for Macmini8,1\n\n"
-
-              'Automatically compiled and package-validated. '
-              'Hardware boot, thermal sensors and fan operation '
-              'have NOT been validated by this workflow.\n\n'
-
-              'Profile: AppleSMC / sensors / fan only; '
+          pathlib.Path('release-notes.md').write_text(
+              f"Proxmox kernel {e['KERNEL_VERSION']}-pve-t2 for Macmini8,1\n\n"
+              'Automatically compiled and package-validated. Hardware boot, '
+              'thermal sensors and fan operation have NOT been validated by '
+              'this workflow.\n\n'
+              'Profile: AppleSMC / thermal sensors / fan support only; '
               'not the complete T2 patchset.\n\n'
-
               f"Proxmox source: {e['PVE_SHA']}\n\n"
-              f"T2 source: {e['T2_SHA']}\n\n"
-
-              f"Build recipe commit: "
-              f"{e['GITHUB_SHA']}\n\n"
-
-              f"Build: "
-              f"https://github.com/"
-              f"{e['GITHUB_REPOSITORY']}/actions/runs/"
+              f"T2 source revision: {e['T2_SHA']}\n\n"
+              f"Macmini8,1 T2 patchset SHA256: {e['T2_PATCHSET_SHA']}\n\n"
+              f"Build recipe commit: {e['GITHUB_SHA']}\n\n"
+              f"Build: https://github.com/{e['GITHUB_REPOSITORY']}/actions/runs/"
               f"{e['GITHUB_RUN_ID']}\n\n"
-
               'Assets: kernel, matching headers and SHA256SUMS. '
               'Verify with `sha256sum -c SHA256SUMS`. '
               'Keep a working kernel for rollback.\n'
@@ -594,11 +548,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          #
-          # Only a genuine 404 means missing.
-          # API/authentication errors must fail.
-          #
 
           STATUS="$(
             curl \
@@ -612,7 +561,6 @@ jobs:
           )"
 
           case "${STATUS}" in
-
             200)
               if [[ "$(jq -r '.draft' release.json)" != true ]]; then
                 echo "This release is already published; keeping existing assets."
@@ -634,12 +582,7 @@ jobs:
               echo "ERROR: release lookup returned HTTP ${STATUS}"
               exit 1
               ;;
-
           esac
-
-          #
-          # Resume an incomplete draft if a previous upload failed.
-          #
 
           gh release upload \
             "${RELEASE_TAG}" \
