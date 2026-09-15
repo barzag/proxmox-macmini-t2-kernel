@@ -1,24 +1,18 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
+set -Eeuo pipefail
 export LC_ALL=C
 
-PVE_DIR="proxmox-pve-kernel"
-T2_DIR="linux-t2-patches"
+SCRIPT_DIR="$(
+  cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1
+  pwd
+)"
 
-TARGET_MODEL="Macmini8,1"
+# shellcheck source=t2-profile-macmini8-1.sh
+source "${SCRIPT_DIR}/t2-profile-macmini8-1.sh"
 
-# Minimal T2 patchset required for Apple SMC / thermal sensors /
-# fan support on Mac mini 2018 (Macmini8,1).
-MACMINI_T2_PATCHES=(
-  "3001-applesmc-convert-static-structures-to-drvdata.patch"
-  "3002-applesmc-make-io-port-base-addr-dynamic.patch"
-  "3003-applesmc-switch-to-acpi_device-from-platform.patch"
-  "3004-applesmc-key-interface-wrappers.patch"
-  "3005-applesmc-basic-mmio-interface-implementation.patch"
-  "3006-applesmc-fan-support-on-T2-Macs.patch"
-  "3008-applesmc-make-applesmc_remove-void.patch"
-)
+PVE_DIR="${PVE_DIR:-proxmox-pve-kernel}"
+T2_DIR="${T2_DIR:-linux-t2-patches}"
 
 if [[ -z "${PVE_SHA:-}" ]]; then
   echo "ERROR: PVE_SHA is not defined" >&2
@@ -27,6 +21,11 @@ fi
 
 if [[ -z "${T2_SHA:-}" ]]; then
   echo "ERROR: T2_SHA is not defined" >&2
+  exit 1
+fi
+
+if [[ -z "${EXPECTED_PATCHSET_SHA:-}" ]]; then
+  echo "ERROR: EXPECTED_PATCHSET_SHA is not defined" >&2
   exit 1
 fi
 
@@ -41,14 +40,11 @@ if [[ ! -d "${T2_DIR}/.git" ]]; then
 fi
 
 echo "Testing compatibility:"
-echo "Target:      ${TARGET_MODEL}"
-echo "Profile:     AppleSMC / sensors / fan only"
-echo "Proxmox SHA: ${PVE_SHA}"
-echo "T2 SHA:      ${T2_SHA}"
-
-#
-# Lock both source trees to the expected revisions.
-#
+echo "Target:          ${T2_TARGET_MODEL}"
+echo "Profile:         ${T2_PROFILE_NAME}"
+echo "Proxmox SHA:     ${PVE_SHA}"
+echo "T2 SHA:          ${T2_SHA}"
+echo "Patchset SHA256: ${EXPECTED_PATCHSET_SHA}"
 
 git -C "${PVE_DIR}" checkout --detach "${PVE_SHA}"
 
@@ -63,16 +59,18 @@ git -C "${PVE_DIR}" submodule update \
 
 git -C "${T2_DIR}" checkout --detach "${T2_SHA}"
 
-#
-# Verify that every patch required by the Macmini8,1 profile exists.
-#
+verify_macmini_t2_profile_files "${T2_DIR}"
 
-for PATCH_NAME in "${MACMINI_T2_PATCHES[@]}"; do
-  if [[ ! -f "${T2_DIR}/${PATCH_NAME}" ]]; then
-    echo "ERROR: required T2 patch is missing: ${PATCH_NAME}" >&2
-    exit 1
-  fi
-done
+ACTUAL_PATCHSET_SHA="$(
+  compute_macmini_t2_patchset_sha "${T2_DIR}"
+)"
+
+if [[ "${ACTUAL_PATCHSET_SHA}" != "${EXPECTED_PATCHSET_SHA}" ]]; then
+  echo "ERROR: T2 patchset fingerprint changed unexpectedly" >&2
+  echo "Expected: ${EXPECTED_PATCHSET_SHA}" >&2
+  echo "Actual:   ${ACTUAL_PATCHSET_SHA}" >&2
+  exit 1
+fi
 
 TOTAL_T2_PATCHES="$(
   find "${T2_DIR}" \
@@ -83,17 +81,12 @@ TOTAL_T2_PATCHES="$(
 )"
 
 REQUIRED_PATCH_COUNT="${#MACMINI_T2_PATCHES[@]}"
+T2_SKIPPED=$((TOTAL_T2_PATCHES - REQUIRED_PATCH_COUNT))
 
-if [[ "${TOTAL_T2_PATCHES}" -lt "${REQUIRED_PATCH_COUNT}" ]]; then
+if [[ "${T2_SKIPPED}" -lt 0 ]]; then
   echo "ERROR: invalid T2 patch repository state" >&2
   exit 1
 fi
-
-T2_SKIPPED=$((TOTAL_T2_PATCHES - REQUIRED_PATCH_COUNT))
-
-#
-# Prepare a clean Linux source tree for compatibility testing.
-#
 
 rm -rf kernel-compat
 
@@ -106,10 +99,6 @@ rm -rf \
   kernel-compat/debian.master
 
 cd kernel-compat
-
-#
-# Apply official Proxmox patches first.
-#
 
 echo
 echo "Applying official Proxmox patches..."
@@ -133,12 +122,8 @@ for patchfile in "../${PVE_DIR}"/patches/kernel/*.patch; do
   fi
 done
 
-#
-# Apply only the Macmini8,1 T2 allowlist.
-#
-
 echo
-echo "Applying Macmini8,1 T2 patches..."
+echo "Applying Macmini8,1 T2 allowlist..."
 
 T2_COUNT=0
 
@@ -156,11 +141,14 @@ for PATCH_NAME in "${MACMINI_T2_PATCHES[@]}"; do
     cat /tmp/t2-patch.log
 
     if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-      echo "compatible=false" >> "${GITHUB_OUTPUT}"
-      echo "failed_patch=${PATCH_NAME}" >> "${GITHUB_OUTPUT}"
-      echo "patch_count=${T2_COUNT}" >> "${GITHUB_OUTPUT}"
-      echo "skipped_count=${T2_SKIPPED}" >> "${GITHUB_OUTPUT}"
-      echo "skipped_patch=non-Macmini8,1 T2 patches" >> "${GITHUB_OUTPUT}"
+      {
+        echo "compatible=false"
+        echo "failed_patch=${PATCH_NAME}"
+        echo "patch_count=${T2_COUNT}"
+        echo "skipped_count=${T2_SKIPPED}"
+        echo "skipped_patch=non-Macmini8,1 T2 patches"
+        echo "patchset_sha=${ACTUAL_PATCHSET_SHA}"
+      } >> "${GITHUB_OUTPUT}"
     fi
 
     echo "ERROR: T2 patch failed: ${PATCH_NAME}" >&2
@@ -179,15 +167,19 @@ fi
 
 echo
 echo "Patch compatibility passed."
-echo "Target:  ${TARGET_MODEL}"
-echo "Applied: ${T2_COUNT}"
-echo "Ignored: ${T2_SKIPPED} non-Macmini8,1 T2 patches"
-echo "Profile: AppleSMC / sensors / fan only"
+echo "Target:          ${T2_TARGET_MODEL}"
+echo "Applied:         ${T2_COUNT}"
+echo "Ignored:         ${T2_SKIPPED} non-Macmini8,1 T2 patches"
+echo "Profile:         ${T2_PROFILE_NAME}"
+echo "Patchset SHA256: ${ACTUAL_PATCHSET_SHA}"
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-  echo "compatible=true" >> "${GITHUB_OUTPUT}"
-  echo "failed_patch=" >> "${GITHUB_OUTPUT}"
-  echo "patch_count=${T2_COUNT}" >> "${GITHUB_OUTPUT}"
-  echo "skipped_count=${T2_SKIPPED}" >> "${GITHUB_OUTPUT}"
-  echo "skipped_patch=non-Macmini8,1 T2 patches" >> "${GITHUB_OUTPUT}"
+  {
+    echo "compatible=true"
+    echo "failed_patch="
+    echo "patch_count=${T2_COUNT}"
+    echo "skipped_count=${T2_SKIPPED}"
+    echo "skipped_patch=non-Macmini8,1 T2 patches"
+    echo "patchset_sha=${ACTUAL_PATCHSET_SHA}"
+  } >> "${GITHUB_OUTPUT}"
 fi
