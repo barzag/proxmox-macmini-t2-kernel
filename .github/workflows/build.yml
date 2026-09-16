@@ -3,7 +3,7 @@ name: Build T2 kernel
 on:
   workflow_dispatch:
   schedule:
-    - cron: '17 */6 * * *'
+    - cron: '17 * * * *'
 
 concurrency:
   group: t2-kernel-build-and-release
