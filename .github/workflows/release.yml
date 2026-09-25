@@ -1,416 +1,226 @@
-name: Release existing T2 kernel
+name: Promote existing T2 release
 
 on:
   workflow_dispatch:
     inputs:
-      run_id:
-        description: "Successful build workflow run ID"
-        required: true
-        default: "34400617786"
-
       tag:
-        description: "Release tag"
+        description: "Existing T2 release tag to promote"
         required: true
-        default: "v7.0.14-16-pve-t2-macmini8-1"
-
-      title:
-        description: "Release title"
-        required: true
-        default: "Proxmox VE 7.0.14-16 T2 kernel for Macmini8,1"
+        type: string
 
 permissions:
-  actions: read
   contents: write
 
 jobs:
-  release:
-    name: Create draft release from existing build
+  promote:
+    name: Validate and promote existing release
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
-      - name: Validate selected build run
-        id: run
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ inputs.run_id }}
-        run: |
-          set -euo pipefail
-
-          echo "Inspecting workflow run ${RUN_ID}..."
-
-          RUN_JSON="$(
-            gh api \
-              "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}"
-          )"
-
-          STATUS="$(
-            jq -r '.status // empty' <<< "${RUN_JSON}"
-          )"
-
-          CONCLUSION="$(
-            jq -r '.conclusion // empty' <<< "${RUN_JSON}"
-          )"
-
-          HEAD_SHA="$(
-            jq -r '.head_sha // empty' <<< "${RUN_JSON}"
-          )"
-
-          HEAD_BRANCH="$(
-            jq -r '.head_branch // empty' <<< "${RUN_JSON}"
-          )"
-
-          WORKFLOW_PATH="$(
-            jq -r '.path // empty' <<< "${RUN_JSON}"
-          )"
-
-          if [[ "${STATUS}" != "completed" ]]; then
-            echo "ERROR: selected workflow run is not completed"
-            echo "Status: ${STATUS}"
-            exit 1
-          fi
-
-          if [[ "${CONCLUSION}" != "success" ]]; then
-            echo "ERROR: selected workflow run did not succeed"
-            echo "Conclusion: ${CONCLUSION}"
-            exit 1
-          fi
-
-          if [[ "${WORKFLOW_PATH}" != ".github/workflows/build.yml" ]]; then
-            echo "ERROR: selected run did not originate from build.yml"
-            echo "Workflow path: ${WORKFLOW_PATH}"
-            exit 1
-          fi
-
-          if [[ -z "${HEAD_SHA}" ]]; then
-            echo "ERROR: unable to resolve build commit SHA"
-            exit 1
-          fi
-
-          echo
-          echo "Build run validated."
-          echo "Run:      ${RUN_ID}"
-          echo "Branch:   ${HEAD_BRANCH}"
-          echo "Commit:   ${HEAD_SHA}"
-          echo "Workflow: ${WORKFLOW_PATH}"
-
-          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
-          echo "head_branch=${HEAD_BRANCH}" >> "$GITHUB_OUTPUT"
-
-      - name: Resolve T2 build artifact
-        id: artifact
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ inputs.run_id }}
-        run: |
-          set -euo pipefail
-
-          echo "Finding T2 artifact for workflow run ${RUN_ID}..."
-
-          ARTIFACTS="$(
-            gh api \
-              "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100"
-          )"
-
-          MATCH_COUNT="$(
-            jq '
-              [
-                .artifacts[] |
-                select(
-                  .expired == false and
-                  (.name | test("^pve-t2-.*-macmini8-1$"))
-                )
-              ] |
-              length
-            ' <<< "${ARTIFACTS}"
-          )"
-
-          if [[ "${MATCH_COUNT}" -ne 1 ]]; then
-            echo "ERROR: expected exactly one valid Macmini8,1 T2 artifact"
-            echo "Matching artifacts: ${MATCH_COUNT}"
-            echo
-            jq -r '
-              .artifacts[] |
-              "\(.id)  \(.name)  expired=\(.expired)"
-            ' <<< "${ARTIFACTS}" || true
-            exit 1
-          fi
-
-          ARTIFACT_ID="$(
-            jq -r '
-              .artifacts[] |
-              select(
-                .expired == false and
-                (.name | test("^pve-t2-.*-macmini8-1$"))
-              ) |
-              .id
-            ' <<< "${ARTIFACTS}"
-          )"
-
-          ARTIFACT_NAME="$(
-            jq -r '
-              .artifacts[] |
-              select(
-                .expired == false and
-                (.name | test("^pve-t2-.*-macmini8-1$"))
-              ) |
-              .name
-            ' <<< "${ARTIFACTS}"
-          )"
-
-          ARTIFACT_DIGEST="$(
-            jq -r '
-              .artifacts[] |
-              select(
-                .expired == false and
-                (.name | test("^pve-t2-.*-macmini8-1$"))
-              ) |
-              .digest // ""
-            ' <<< "${ARTIFACTS}"
-          )"
-
-          echo
-          echo "Artifact selected:"
-          echo "ID:     ${ARTIFACT_ID}"
-          echo "Name:   ${ARTIFACT_NAME}"
-          echo "Digest: ${ARTIFACT_DIGEST}"
-
-          echo "id=${ARTIFACT_ID}" >> "$GITHUB_OUTPUT"
-          echo "name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
-          echo "digest=${ARTIFACT_DIGEST}" >> "$GITHUB_OUTPUT"
-
-      - name: Download existing build artifact
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ARTIFACT_ID: ${{ steps.artifact.outputs.id }}
-        run: |
-          set -euo pipefail
-
-          rm -rf release-assets artifact.zip
-          mkdir -p release-assets
-
-          echo "Downloading artifact ${ARTIFACT_ID}..."
-
-          curl \
-            --fail \
-            --location \
-            --silent \
-            --show-error \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
-            -o artifact.zip
-
-          echo "Extracting artifact..."
-
-          python3 -m zipfile -e \
-            artifact.zip \
-            release-assets
-
-          rm -f artifact.zip
-
-          echo "Artifact downloaded and extracted."
-
-      - name: Validate downloaded packages
-        id: packages
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Downloaded files:"
-          find release-assets -type f -print
-
-          mapfile -t KERNEL_DEBS < <(
-            find release-assets \
-              -type f \
-              -name 'proxmox-kernel-*-pve-t2_*.deb'
-          )
-
-          mapfile -t HEADER_DEBS < <(
-            find release-assets \
-              -type f \
-              -name 'proxmox-headers-*-pve-t2_*.deb'
-          )
-
-          mapfile -t SUM_FILES < <(
-            find release-assets \
-              -type f \
-              -name 'SHA256SUMS'
-          )
-
-          if [[ "${#KERNEL_DEBS[@]}" -ne 1 ]]; then
-            echo "ERROR: expected exactly one kernel .deb"
-            echo "Found: ${#KERNEL_DEBS[@]}"
-            exit 1
-          fi
-
-          if [[ "${#HEADER_DEBS[@]}" -ne 1 ]]; then
-            echo "ERROR: expected exactly one headers .deb"
-            echo "Found: ${#HEADER_DEBS[@]}"
-            exit 1
-          fi
-
-          if [[ "${#SUM_FILES[@]}" -ne 1 ]]; then
-            echo "ERROR: expected exactly one SHA256SUMS file"
-            echo "Found: ${#SUM_FILES[@]}"
-            exit 1
-          fi
-
-          KERNEL_DEB="${KERNEL_DEBS[0]}"
-          HEADER_DEB="${HEADER_DEBS[0]}"
-          SUM_FILE="${SUM_FILES[0]}"
-
-          echo
-          echo "Kernel package:"
-          dpkg-deb \
-            --show \
-            --showformat='Package: ${Package}\nVersion: ${Version}\nArchitecture: ${Architecture}\n' \
-            "${KERNEL_DEB}"
-
-          echo
-          echo "Headers package:"
-          dpkg-deb \
-            --show \
-            --showformat='Package: ${Package}\nVersion: ${Version}\nArchitecture: ${Architecture}\n' \
-            "${HEADER_DEB}"
-
-          echo
-          echo "Checking SHA256SUMS..."
-
-          while read -r EXPECTED FILE_PATH; do
-            [[ -n "${EXPECTED}" ]] || continue
-
-            FILE_NAME="$(basename "${FILE_PATH}")"
-
-            MATCH="$(
-              find release-assets \
-                -type f \
-                -name "${FILE_NAME}" \
-                -print \
-                -quit
-            )"
-
-            if [[ -z "${MATCH}" ]]; then
-              echo "ERROR: checksum references missing file: ${FILE_NAME}"
-              exit 1
-            fi
-
-            ACTUAL="$(
-              sha256sum "${MATCH}" |
-              awk '{print $1}'
-            )"
-
-            if [[ "${ACTUAL}" != "${EXPECTED}" ]]; then
-              echo "ERROR: SHA256 mismatch for ${FILE_NAME}"
-              echo "Expected: ${EXPECTED}"
-              echo "Actual:   ${ACTUAL}"
-              exit 1
-            fi
-
-            echo "OK: ${FILE_NAME}"
-          done < "${SUM_FILE}"
-
-          echo
-          echo "All package checks passed."
-
-          echo "kernel_deb=${KERNEL_DEB}" >> "$GITHUB_OUTPUT"
-          echo "header_deb=${HEADER_DEB}" >> "$GITHUB_OUTPUT"
-          echo "sum_file=${SUM_FILE}" >> "$GITHUB_OUTPUT"
-
-      - name: Prepare release notes
-        shell: bash
-        env:
-          RUN_ID: ${{ inputs.run_id }}
-          HEAD_SHA: ${{ steps.run.outputs.head_sha }}
-          HEAD_BRANCH: ${{ steps.run.outputs.head_branch }}
-          ARTIFACT_NAME: ${{ steps.artifact.outputs.name }}
-          ARTIFACT_DIGEST: ${{ steps.artifact.outputs.digest }}
-        run: |
-          set -euo pipefail
-
-          cat > release-notes.md <<EOF
-          # Proxmox T2 kernel for Macmini8,1
-
-          This release contains packages produced by an already completed
-          GitHub Actions kernel build.
-
-          ## Build provenance
-
-          - Target hardware: \`Macmini8,1\`
-          - Build workflow run: \`${RUN_ID}\`
-          - Build branch: \`${HEAD_BRANCH}\`
-          - Build commit: \`${HEAD_SHA}\`
-          - Artifact: \`${ARTIFACT_NAME}\`
-          - Artifact digest: \`${ARTIFACT_DIGEST}\`
-
-          ## Packages
-
-          - T2 Proxmox kernel package
-          - Matching T2 kernel headers
-          - SHA256 checksums
-
-          ## Validation status
-
-          The kernel packages were successfully compiled and passed the
-          automated package validation performed by the build workflow.
-
-          **This release remains a draft until the kernel has been installed
-          and validated on the target Macmini8,1 hardware.**
-
-          No kernel compilation is performed by this release workflow.
-          EOF
-
-      - name: Create draft GitHub release
+      - name: Inspect release
+        id: release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
-          RELEASE_TITLE: ${{ inputs.title }}
-          HEAD_SHA: ${{ steps.run.outputs.head_sha }}
-          KERNEL_DEB: ${{ steps.packages.outputs.kernel_deb }}
-          HEADER_DEB: ${{ steps.packages.outputs.header_deb }}
-          SUM_FILE: ${{ steps.packages.outputs.sum_file }}
         run: |
           set -euo pipefail
 
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "ERROR: release ${RELEASE_TAG} already exists"
+          echo "Inspecting release:"
+          echo "${RELEASE_TAG}"
+
+          RELEASE_JSON="$(
+            gh api \
+              "repos/${GH_REPO}/releases/tags/${RELEASE_TAG}"
+          )"
+
+          RELEASE_ID="$(
+            jq -r '.id // empty' \
+              <<< "${RELEASE_JSON}"
+          )"
+
+          RELEASE_NAME="$(
+            jq -r '.name // empty' \
+              <<< "${RELEASE_JSON}"
+          )"
+
+          DRAFT="$(
+            jq -r '.draft' \
+              <<< "${RELEASE_JSON}"
+          )"
+
+          PRERELEASE="$(
+            jq -r '.prerelease' \
+              <<< "${RELEASE_JSON}"
+          )"
+
+          URL="$(
+            jq -r '.html_url // empty' \
+              <<< "${RELEASE_JSON}"
+          )"
+
+          if [[ -z "${RELEASE_ID}" ]]; then
+            echo "ERROR: release ID is empty"
             exit 1
           fi
 
-          echo "Creating draft release:"
-          echo "Tag:    ${RELEASE_TAG}"
-          echo "Title:  ${RELEASE_TITLE}"
-          echo "Target: ${HEAD_SHA}"
+          KERNEL_COUNT="$(
+            jq '
+              [
+                .assets[] |
+                select(
+                  .state == "uploaded" and
+                  (.name | test(
+                    "^proxmox-kernel-.*-pve-t2_.*_amd64\\.deb$"
+                  ))
+                )
+              ] |
+              length
+            ' <<< "${RELEASE_JSON}"
+          )"
 
-          gh release create \
-            "${RELEASE_TAG}" \
-            "${KERNEL_DEB}" \
-            "${HEADER_DEB}" \
-            "${SUM_FILE}" \
-            --draft \
-            --latest=false \
-            --target "${GITHUB_SHA}" \
-            --title "${RELEASE_TITLE}" \
-            --notes-file release-notes.md
+          HEADER_COUNT="$(
+            jq '
+              [
+                .assets[] |
+                select(
+                  .state == "uploaded" and
+                  (.name | test(
+                    "^proxmox-headers-.*-pve-t2_.*_amd64\\.deb$"
+                  ))
+                )
+              ] |
+              length
+            ' <<< "${RELEASE_JSON}"
+          )"
 
-      - name: Write release summary
+          SUM_COUNT="$(
+            jq '
+              [
+                .assets[] |
+                select(
+                  .state == "uploaded" and
+                  .name == "SHA256SUMS"
+                )
+              ] |
+              length
+            ' <<< "${RELEASE_JSON}"
+          )"
+
+          TOTAL_ASSETS="$(
+            jq '.assets | length' \
+              <<< "${RELEASE_JSON}"
+          )"
+
+          if [[ "${KERNEL_COUNT}" -ne 1 ]]; then
+            echo "ERROR: expected exactly one kernel package"
+            exit 1
+          fi
+
+          if [[ "${HEADER_COUNT}" -ne 1 ]]; then
+            echo "ERROR: expected exactly one headers package"
+            exit 1
+          fi
+
+          if [[ "${SUM_COUNT}" -ne 1 ]]; then
+            echo "ERROR: expected exactly one SHA256SUMS file"
+            exit 1
+          fi
+
+          if [[ "${TOTAL_ASSETS}" -ne 3 ]]; then
+            echo "ERROR: expected exactly three release assets"
+            echo "Found: ${TOTAL_ASSETS}"
+            exit 1
+          fi
+
+          echo
+          echo "Release validated."
+          echo "ID:         ${RELEASE_ID}"
+          echo "Name:       ${RELEASE_NAME}"
+          echo "Draft:      ${DRAFT}"
+          echo "Prerelease: ${PRERELEASE}"
+          echo "URL:        ${URL}"
+
+          {
+            echo "id=${RELEASE_ID}"
+            echo "name=${RELEASE_NAME}"
+            echo "url=${URL}"
+            echo "draft=${DRAFT}"
+            echo "prerelease=${PRERELEASE}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Promote to stable Latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ steps.release.outputs.id }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          echo "Promoting:"
+          echo "${RELEASE_TAG}"
+
+          gh api \
+            --method PATCH \
+            "repos/${GH_REPO}/releases/${RELEASE_ID}" \
+            -F draft=false \
+            -F prerelease=false \
+            -f make_latest=true \
+            > promoted-release.json
+
+          DRAFT="$(
+            jq -r '.draft' \
+              promoted-release.json
+          )"
+
+          PRERELEASE="$(
+            jq -r '.prerelease' \
+              promoted-release.json
+          )"
+
+          if [[ "${DRAFT}" != false ]]; then
+            echo "ERROR: release is still a draft"
+            exit 1
+          fi
+
+          if [[ "${PRERELEASE}" != false ]]; then
+            echo "ERROR: release is still marked as prerelease"
+            exit 1
+          fi
+
+          LATEST_ID="$(
+            gh api \
+              "repos/${GH_REPO}/releases/latest" \
+              --jq '.id'
+          )"
+
+          if [[ "${LATEST_ID}" != "${RELEASE_ID}" ]]; then
+            echo "ERROR: GitHub Latest does not point to this release"
+            echo "Expected ID: ${RELEASE_ID}"
+            echo "Latest ID:   ${LATEST_ID}"
+            exit 1
+          fi
+
+          echo
+          echo "Release successfully promoted to stable Latest."
+
+      - name: Write summary
         if: always()
         shell: bash
         run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          # T2 kernel release
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF_SUMMARY
+          # T2 release promotion
 
-          - Source build run: \`${{ inputs.run_id }}\`
-          - Artifact: \`${{ steps.artifact.outputs.name }}\`
-          - Build commit: \`${{ steps.run.outputs.head_sha }}\`
-          - Release tag: \`${{ inputs.tag }}\`
-          - Release state: **draft**
+          - Tag: \`${{ inputs.tag }}\`
+          - Release: \`${{ steps.release.outputs.name }}\`
+          - Previous draft state: \`${{ steps.release.outputs.draft }}\`
+          - Previous prerelease state: \`${{ steps.release.outputs.prerelease }}\`
+          - Target state: **stable Latest release**
 
-          **No kernel compilation was performed.**
-          EOF
+          No kernel compilation was performed by this workflow.
+          EOF_SUMMARY
