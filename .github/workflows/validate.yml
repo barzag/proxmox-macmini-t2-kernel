@@ -14,7 +14,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Discover latest published Proxmox kernel
         id: pve_repo
@@ -31,38 +31,58 @@ jobs:
         run: |
           bash scripts/resolve-proxmox.sh
 
+      - name: Skip validation while Proxmox source is pending
+        if: steps.pve.outputs.status == 'pending'
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ steps.pve_repo.outputs.version }}
+        run: |
+          echo "::notice title=Proxmox source pending::${PACKAGE_VERSION} is published in APT, but the matching Git source is not available yet. Validation skipped."
+
       - name: Resolve T2 patch candidate
+        if: steps.pve.outputs.status == 'resolved'
         id: t2
         shell: bash
         env:
           PVE_KERNEL: ${{ steps.pve_repo.outputs.kernel }}
         run: |
           bash scripts/resolve-t2.sh
-          
+
       - name: Validate T2 patch application
+        if: steps.pve.outputs.status == 'resolved'
         id: compat
         shell: bash
         env:
           PVE_SHA: ${{ steps.pve.outputs.sha }}
           T2_SHA: ${{ steps.t2.outputs.sha }}
+          EXPECTED_PATCHSET_SHA: ${{ steps.t2.outputs.patchset_sha }}
         run: |
           bash scripts/validate-patches.sh
 
       - name: Validate T2 integration inputs
+        if: steps.pve.outputs.status == 'resolved'
         id: config
         shell: bash
         run: |
           bash scripts/validate-config.sh
-          
+
       - name: Validate T2 build preparation
+        if: steps.pve.outputs.status == 'resolved' && steps.compat.outputs.compatible == 'true'
         id: integrate
         shell: bash
         env:
           PVE_SHA: ${{ steps.pve.outputs.sha }}
           T2_SHA: ${{ steps.t2.outputs.sha }}
           EXPECTED_PATCH_COUNT: ${{ steps.compat.outputs.patch_count }}
+          EXPECTED_PATCHSET_SHA: ${{ steps.compat.outputs.patchset_sha }}
         run: |
           bash scripts/prepare-integration.sh
+
+      - name: Report blocked compatibility
+        if: steps.pve.outputs.status == 'resolved' && steps.compat.outputs.compatible == 'false'
+        shell: bash
+        run: |
+          echo "::warning title=T2 compatibility blocked::Patch ${{ steps.compat.outputs.failed_patch }} requires manual review. No build integration was performed."
 
       - name: Write validation summary
         if: always()
@@ -73,6 +93,7 @@ jobs:
 
           ## Target
           - Hardware: `Macmini8,1`
+          - Profile: `AppleSMC / thermal sensors / fan support only`
 
           ## Published Proxmox kernel
           - Package: `${{ steps.pve_repo.outputs.package }}`
@@ -80,6 +101,7 @@ jobs:
           - Package version: `${{ steps.pve_repo.outputs.version }}`
 
           ## Proxmox source
+          - Status: `${{ steps.pve.outputs.status }}`
           - SHA: `${{ steps.pve.outputs.sha }}`
           - Commit: `${{ steps.pve.outputs.subject }}`
 
@@ -87,13 +109,21 @@ jobs:
           - SHA: `${{ steps.t2.outputs.sha }}`
           - Kernel target: `${{ steps.t2.outputs.kver }}`
           - Commit: `${{ steps.t2.outputs.subject }}`
+          - Upstream allowlist SHA256: `${{ steps.t2.outputs.patchset_sha }}`
 
           ## Compatibility
+          - Compatible: `${{ steps.compat.outputs.compatible }}`
           - T2 patches applied: `${{ steps.compat.outputs.patch_count }}`
           - T2 patches skipped: `${{ steps.compat.outputs.skipped_count }}`
-          - Skipped patch: `${{ steps.compat.outputs.skipped_patch }}`
+          - Failed patch: `${{ steps.compat.outputs.failed_patch }}`
+          - Reviewed compatibility replacements used: `${{ steps.compat.outputs.compat_override_count }}`
+          - Compatibility replacements: `${{ steps.compat.outputs.compat_overrides }}`
+          - Effective patchset SHA256: `${{ steps.compat.outputs.patchset_sha }}`
+
+          ## Integration
           - T2 configuration entries: `${{ steps.config.outputs.config_count }}`
+          - Build preparation: `${{ steps.integrate.outcome }}`
 
           ## Build
-          **No kernel compilation is performed by this workflow.**
+          **No kernel compilation or release publication is performed by this workflow.**
           EOF
