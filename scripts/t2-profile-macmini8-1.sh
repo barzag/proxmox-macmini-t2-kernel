@@ -1,84 +1,65 @@
-#!/usr/bin/env bash
+        'ERROR: compatibility override is not part of the Macmini8,1 allowlist: %s\n' \
+        "${patch}" >&2
+      return 1
+    fi
 
-# Shared T2 profile for Mac mini 2018 (Macmini8,1).
-#
-# This file is sourced by the resolver, compatibility validator and integration
-# script. Keeping the profile in one place prevents the three stages from
-# silently drifting apart.
-
-T2_TARGET_MODEL="Macmini8,1"
-T2_PROFILE_NAME="AppleSMC / thermal sensors / fan support only"
-
-# Exact upstream patches intentionally included in the Macmini8,1 profile.
-MACMINI_T2_PATCHES=(
-  "3001-applesmc-convert-static-structures-to-drvdata.patch"
-  "3002-applesmc-make-io-port-base-addr-dynamic.patch"
-  "3003-applesmc-switch-to-acpi_device-from-platform.patch"
-  "3004-applesmc-key-interface-wrappers.patch"
-  "3005-applesmc-basic-mmio-interface-implementation.patch"
-  "3006-applesmc-fan-support-on-T2-Macs.patch"
-  "3008-applesmc-make-applesmc_remove-void.patch"
-)
-
-# Known AppleSMC patches that were reviewed and are intentionally excluded from
-# this Mac mini profile. They should not trigger the "new potentially relevant
-# patch" warning.
-MACMINI_T2_REVIEWED_IGNORED_PATCHES=(
-  "3007-applesmc-Add-iMacPro-to-applesmc_whitelist.patch"
-  "3009-applesmc-battery-charge-limiter.patch"
-)
-
-is_macmini_t2_allowlisted_patch()
-{
-  local candidate="$1"
-  local patch
-
-  for patch in "${MACMINI_T2_PATCHES[@]}"; do
-    [[ "${candidate}" == "${patch}" ]] && return 0
-  done
-
-  return 1
-}
-
-is_macmini_t2_reviewed_ignored_patch()
-{
-  local candidate="$1"
-  local patch
-
-  for patch in "${MACMINI_T2_REVIEWED_IGNORED_PATCHES[@]}"; do
-    [[ "${candidate}" == "${patch}" ]] && return 0
-  done
-
-  return 1
-}
-
-verify_macmini_t2_profile_files()
-{
-  local t2_dir="$1"
-  local patch
-
-  for patch in "${MACMINI_T2_PATCHES[@]}"; do
-    if [[ ! -f "${t2_dir}/${patch}" ]]; then
-      printf 'ERROR: required T2 patch is missing: %s\n' "${patch}" >&2
+    if [[ ! -f "${MACMINI_T2_COMPAT_DIR}/${patch}" ]]; then
+      printf 'ERROR: reviewed compatibility patch is missing: %s\n' \
+        "${MACMINI_T2_COMPAT_DIR}/${patch}" >&2
       return 1
     fi
   done
 }
 
-compute_macmini_t2_patchset_sha()
+verify_macmini_t2_effective_profile_files()
 {
-  local t2_dir="$1"
+  local effective_dir="$1"
   local patch
 
-  verify_macmini_t2_profile_files "${t2_dir}" || return 1
+  for patch in "${MACMINI_T2_PATCHES[@]}"; do
+    if [[ ! -f "${effective_dir}/${patch}" ]]; then
+      printf 'ERROR: effective T2 patch is missing: %s\n' \
+        "${effective_dir}/${patch}" >&2
+      return 1
+    fi
+  done
+}
+
+compute_macmini_t2_patchset_sha_from_dir()
+{
+  local patch_dir="$1"
+  local patch
+
+  verify_macmini_t2_effective_profile_files "${patch_dir}" || return 1
 
   {
     for patch in "${MACMINI_T2_PATCHES[@]}"; do
       printf 'FILE:%s\n' "${patch}"
-      cat "${t2_dir}/${patch}"
+      cat "${patch_dir}/${patch}"
       printf '\nEND:%s\n' "${patch}"
     done
   } | sha256sum | awk '{print $1}'
+}
+
+# Fingerprint of the exact upstream allowlisted patchset at the resolved T2
+# revision. This preserves the existing resolver behaviour.
+compute_macmini_t2_patchset_sha()
+{
+  local t2_dir="$1"
+
+  verify_macmini_t2_profile_files "${t2_dir}" || return 1
+  compute_macmini_t2_patchset_sha_from_dir "${t2_dir}"
+}
+
+# Fingerprint of the exact patch files selected by the compatibility validator.
+# The validator will build an effective patch directory containing either the
+# upstream patch or an explicitly reviewed compatibility replacement for every
+# allowlisted patch.
+compute_macmini_t2_effective_patchset_sha()
+{
+  local effective_dir="$1"
+
+  compute_macmini_t2_patchset_sha_from_dir "${effective_dir}"
 }
 
 patch_matches_macmini_t2_pattern()
