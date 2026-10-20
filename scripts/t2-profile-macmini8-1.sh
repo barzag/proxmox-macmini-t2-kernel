@@ -1,3 +1,131 @@
+#!/usr/bin/env bash
+
+# Shared T2 profile for Mac mini 2018 (Macmini8,1).
+#
+# This file is sourced by the resolver, compatibility validator and integration
+# script. Keeping the profile in one place prevents the three stages from
+# silently drifting apart.
+
+T2_TARGET_MODEL="Macmini8,1"
+T2_PROFILE_NAME="AppleSMC / thermal sensors / fan support only"
+
+T2_PROFILE_SCRIPT_DIR="$(
+  cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1
+  pwd
+)"
+
+T2_REPOSITORY_ROOT="$(
+  cd -- "${T2_PROFILE_SCRIPT_DIR}/.." >/dev/null 2>&1
+  pwd
+)"
+
+# Local, reviewed compatibility replacements.
+# The environment variable remains overridable for tests.
+MACMINI_T2_COMPAT_DIR="${MACMINI_T2_COMPAT_DIR:-${T2_REPOSITORY_ROOT}/patches/compat/applesmc}"
+
+# Exact upstream patches intentionally included in the Macmini8,1 profile.
+MACMINI_T2_PATCHES=(
+  "3001-applesmc-convert-static-structures-to-drvdata.patch"
+  "3002-applesmc-make-io-port-base-addr-dynamic.patch"
+  "3003-applesmc-switch-to-acpi_device-from-platform.patch"
+  "3004-applesmc-key-interface-wrappers.patch"
+  "3005-applesmc-basic-mmio-interface-implementation.patch"
+  "3006-applesmc-fan-support-on-T2-Macs.patch"
+  "3008-applesmc-make-applesmc_remove-void.patch"
+)
+
+# Known AppleSMC patches that were reviewed and are intentionally excluded from
+# this Mac mini profile. They should not trigger the "new potentially relevant
+# patch" warning.
+MACMINI_T2_REVIEWED_IGNORED_PATCHES=(
+  "3007-applesmc-Add-iMacPro-to-applesmc_whitelist.patch"
+  "3009-applesmc-battery-charge-limiter.patch"
+)
+
+# Reviewed local compatibility overrides.
+#
+# These are NOT additional patches. They may replace the corresponding upstream
+# patch only after the normal upstream patch has failed a strict compatibility
+# check. No file is automatically trusted merely because it exists in the
+# compatibility directory.
+MACMINI_T2_COMPAT_PATCHES=(
+  "3001-applesmc-convert-static-structures-to-drvdata.patch"
+)
+
+is_macmini_t2_allowlisted_patch()
+{
+  local candidate="$1"
+  local patch
+
+  for patch in "${MACMINI_T2_PATCHES[@]}"; do
+    [[ "${candidate}" == "${patch}" ]] && return 0
+  done
+
+  return 1
+}
+
+is_macmini_t2_reviewed_ignored_patch()
+{
+  local candidate="$1"
+  local patch
+
+  for patch in "${MACMINI_T2_REVIEWED_IGNORED_PATCHES[@]}"; do
+    [[ "${candidate}" == "${patch}" ]] && return 0
+  done
+
+  return 1
+}
+
+is_macmini_t2_compat_patch()
+{
+  local candidate="$1"
+  local patch
+
+  for patch in "${MACMINI_T2_COMPAT_PATCHES[@]}"; do
+    [[ "${candidate}" == "${patch}" ]] && return 0
+  done
+
+  return 1
+}
+
+macmini_t2_compat_patch_file()
+{
+  local patch_name="$1"
+  local patch_file
+
+  is_macmini_t2_compat_patch "${patch_name}" || return 1
+
+  patch_file="${MACMINI_T2_COMPAT_DIR}/${patch_name}"
+
+  if [[ ! -f "${patch_file}" ]]; then
+    printf 'ERROR: reviewed compatibility patch is missing: %s\n' \
+      "${patch_file}" >&2
+    return 1
+  fi
+
+  printf '%s\n' "${patch_file}"
+}
+
+verify_macmini_t2_profile_files()
+{
+  local t2_dir="$1"
+  local patch
+
+  for patch in "${MACMINI_T2_PATCHES[@]}"; do
+    if [[ ! -f "${t2_dir}/${patch}" ]]; then
+      printf 'ERROR: required T2 patch is missing: %s\n' "${patch}" >&2
+      return 1
+    fi
+  done
+}
+
+verify_macmini_t2_compat_files()
+{
+  local patch
+
+  for patch in "${MACMINI_T2_COMPAT_PATCHES[@]}"; do
+    if ! is_macmini_t2_allowlisted_patch "${patch}"; then
+      printf \
         'ERROR: compatibility override is not part of the Macmini8,1 allowlist: %s\n' \
         "${patch}" >&2
       return 1
