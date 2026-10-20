@@ -44,6 +44,19 @@ if [[ ! -d "${T2_DIR}/.git" ]]; then
   exit 1
 fi
 
+# Resolve repository directories to absolute paths before entering the temporary
+# kernel tree. This prevents later patch lookups from depending on the current
+# working directory.
+PVE_DIR="$(
+  cd -- "${PVE_DIR}" >/dev/null 2>&1
+  pwd
+)"
+
+T2_DIR="$(
+  cd -- "${T2_DIR}" >/dev/null 2>&1
+  pwd
+)"
+
 verify_macmini_t2_compat_files
 
 echo "Testing compatibility:"
