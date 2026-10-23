@@ -1041,9 +1041,8 @@ index 90a14a7f2c4c..a611c98871a2 100644
  }
  
  static int applesmc_dmi_match(const struct dmi_system_id *id)
-@@ -1307,86 +1398,100 @@ static const struct dmi_system_id applesmc_whitelist[] __initconst = {
+@@ -1307,85 +1398,99 @@ static const struct dmi_system_id applesmc_whitelist[] __initconst = {
  };
- MODULE_DEVICE_TABLE(dmi, applesmc_whitelist);
  
 -static int __init applesmc_init(void)
 +static int applesmc_create_modules(struct applesmc_device *smc)
@@ -1206,13 +1205,14 @@ index 90a14a7f2c4c..a611c98871a2 100644
  	platform_device_unregister(pdev);
  	platform_driver_unregister(&applesmc_driver);
  	release_region(APPLESMC_DATA_PORT, APPLESMC_NR_PORTS);
-@@ -1415,5 +1512,6 @@ module_init(applesmc_init);
+@@ -1415,6 +1512,7 @@ module_init(applesmc_init);
  module_exit(applesmc_exit);
  
  MODULE_AUTHOR("Nicolas Boichat");
 +MODULE_AUTHOR("Paul Pawlowski");
  MODULE_DESCRIPTION("Apple SMC");
  MODULE_LICENSE("GPL v2");
+ MODULE_DEVICE_TABLE(dmi, applesmc_whitelist);
 -- 
 2.55.0
 
