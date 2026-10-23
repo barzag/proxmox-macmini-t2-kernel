@@ -3,7 +3,7 @@ name: Build T2 kernel
 on:
   workflow_dispatch:
   schedule:
-    - cron: '17 * * * *'
+    - cron: '17 */6 * * *'
 
 concurrency:
   group: t2-kernel-build-and-release
@@ -14,25 +14,27 @@ permissions:
 
 jobs:
   discover:
-    name: Discover and build changed upstream revisions
-    if: github.ref == 'refs/heads/main'
+    name: Discover, validate and build changed upstream revisions
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 180
 
     outputs:
-      changed: ${{ steps.pve.outputs.status == 'resolved' && steps.candidate.outputs.changed == 'true' && 'true' || 'false' }}
-      promote: ${{ steps.candidate.outputs.promote }}
+      changed: ${{ steps.compat.outputs.compatible == 'true' && steps.candidate.outputs.changed == 'true' && 'true' || 'false' }}
+      promote: ${{ steps.compat.outputs.compatible == 'true' && steps.candidate.outputs.promote == 'true' && 'true' || 'false' }}
       release_id: ${{ steps.candidate.outputs.release_id }}
       tag: ${{ steps.candidate.outputs.tag }}
       kernel: ${{ steps.pve_repo.outputs.kernel }}
       pve_sha: ${{ steps.pve.outputs.sha }}
       t2_sha: ${{ steps.t2.outputs.sha }}
-      t2_patchset_sha: ${{ steps.t2.outputs.patchset_sha }}
+      t2_upstream_patchset_sha: ${{ steps.t2.outputs.patchset_sha }}
+      t2_patchset_sha: ${{ steps.compat.outputs.patchset_sha }}
+      compat_overrides: ${{ steps.compat.outputs.compat_overrides }}
       source_status: ${{ steps.pve.outputs.status }}
-      t2_review_count: ${{ steps.t2.outputs.review_count }}
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Discover latest published Proxmox kernel
         id: pve_repo
@@ -49,13 +51,13 @@ jobs:
         run: |
           bash scripts/resolve-proxmox.sh
 
-      - name: Skip build while Proxmox source is pending
+      - name: Wait for Proxmox source
         if: steps.pve.outputs.status == 'pending'
         shell: bash
         env:
           PACKAGE_VERSION: ${{ steps.pve_repo.outputs.version }}
         run: |
-          echo "::notice title=Proxmox source pending::${PACKAGE_VERSION} is published in APT, but the matching Git source is not available yet. T2 build skipped; the scheduled workflow will retry later."
+          echo "::notice title=Waiting for Proxmox source::${PACKAGE_VERSION} is published in APT, but the matching Git source is not available yet. No build or release will be performed; the scheduled workflow will retry."
 
       - name: Resolve Macmini8,1 T2 patch candidate
         if: steps.pve.outputs.status == 'resolved'
@@ -66,322 +68,8 @@ jobs:
         run: |
           bash scripts/resolve-t2.sh
 
-      - name: Check whether this Macmini8,1 build is already published
+      - name: Validate T2 patch compatibility
         if: steps.pve.outputs.status == 'resolved'
-        id: candidate
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PVE_SHA: ${{ steps.pve.outputs.sha }}
-          T2_PATCHSET_SHA: ${{ steps.t2.outputs.patchset_sha }}
-          KERNEL_VERSION: ${{ steps.pve_repo.outputs.kernel }}
-          PACKAGE_VERSION: ${{ steps.pve_repo.outputs.version }}
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import hashlib
-          import json
-          import os
-          import subprocess
-          import urllib.error
-          import urllib.request
-
-          e = os.environ
-
-          recipe = subprocess.check_output([
-              'git',
-              'rev-parse',
-              'HEAD:scripts',
-              'HEAD:.github/workflows/build.yml'
-          ]).decode()
-
-          identity = '\n'.join([
-              e['PVE_SHA'],
-              e['T2_PATCHSET_SHA'],
-              e['PACKAGE_VERSION'],
-              recipe
-          ])
-
-          digest = hashlib.sha256(
-              identity.encode()
-          ).hexdigest()
-
-          preferred_tag = (
-              f"auto-{e['KERNEL_VERSION']}-pve-t2-{digest}"
-          )
-
-          api = (
-              f"https://api.github.com/repos/"
-              f"{e['GITHUB_REPOSITORY']}"
-          )
-
-          headers = {
-              'Authorization':
-                  'Bearer ' + e['GH_TOKEN'],
-              'Accept':
-                  'application/vnd.github+json',
-              'X-GitHub-Api-Version':
-                  '2022-11-28'
-          }
-
-          def request_json(url):
-              request = urllib.request.Request(
-                  url,
-                  headers=headers
-              )
-
-              with urllib.request.urlopen(
-                  request,
-                  timeout=60
-              ) as response:
-                  return json.load(response)
-
-          #
-          # Determine the release currently exposed by GitHub
-          # as the repository Latest release.
-          #
-
-          latest_release_id = ''
-
-          try:
-              latest_release = request_json(
-                  f"{api}/releases/latest"
-              )
-
-              latest_release_id = str(
-                  latest_release['id']
-              )
-
-          except urllib.error.HTTPError as error:
-              if error.code != 404:
-                  raise
-
-          changed = False
-          promote = False
-          release_id = ''
-          selected_tag = preferred_tag
-          exact_release = None
-
-          #
-          # First look for the exact release identity generated
-          # by the current workflow.
-          #
-
-          try:
-              exact_release = request_json(
-                  f"{api}/releases/tags/{preferred_tag}"
-              )
-
-          except urllib.error.HTTPError as error:
-              if error.code != 404:
-                  raise
-
-          if exact_release is not None:
-
-              release_id = str(
-                  exact_release['id']
-              )
-
-              if exact_release.get(
-                  'draft',
-                  False
-              ):
-                  #
-                  # Incomplete draft.
-                  #
-                  # Rebuild/finish publication.
-                  #
-                  changed = True
-
-              elif exact_release.get(
-                  'prerelease',
-                  False
-              ):
-                  #
-                  # Exact validated build already exists but is
-                  # still using the legacy prerelease state.
-                  #
-                  # Do not rebuild.
-                  #
-                  changed = False
-                  promote = True
-
-              else:
-                  #
-                  # Exact stable release already exists.
-                  #
-                  changed = False
-
-                  #
-                  # Repair GitHub's Latest pointer if required.
-                  #
-                  if (
-                      latest_release_id
-                      != release_id
-                  ):
-                      promote = True
-
-          else:
-              #
-              # Compatibility with releases generated by older
-              # versions of build.yml.
-              #
-              # Their tag digest may differ because build.yml is
-              # part of the recipe fingerprint.
-              #
-              # Search for an already validated release with the
-              # same actual kernel inputs:
-              #
-              #   - same Proxmox kernel version
-              #   - same Proxmox source SHA
-              #   - same Macmini8,1 T2 patchset SHA
-              #
-              # Search BOTH prereleases and stable releases.
-              #
-
-              releases = request_json(
-                  f"{api}/releases?per_page=100"
-              )
-
-              pve_marker = (
-                  f"Proxmox source: "
-                  f"{e['PVE_SHA']}"
-              )
-
-              patchset_marker = (
-                  "Macmini8,1 T2 patchset SHA256: "
-                  f"{e['T2_PATCHSET_SHA']}"
-              )
-
-              kernel_marker = (
-                  f"auto-"
-                  f"{e['KERNEL_VERSION']}"
-                  f"-pve-t2-"
-              )
-
-              matching_release = None
-
-              for release in releases:
-
-                  #
-                  # Drafts are incomplete and cannot be used as
-                  # proof of an already-published validated build.
-                  #
-                  if release.get(
-                      'draft',
-                      False
-                  ):
-                      continue
-
-                  if not release.get(
-                      'tag_name',
-                      ''
-                  ).startswith(
-                      kernel_marker
-                  ):
-                      continue
-
-                  body = (
-                      release.get('body')
-                      or ''
-                  )
-
-                  if pve_marker not in body:
-                      continue
-
-                  if patchset_marker not in body:
-                      continue
-
-                  matching_release = release
-                  break
-
-              if matching_release is not None:
-
-                  selected_tag = (
-                      matching_release[
-                          'tag_name'
-                      ]
-                  )
-
-                  release_id = str(
-                      matching_release[
-                          'id'
-                      ]
-                  )
-
-                  changed = False
-
-                  #
-                  # Promotion/repair is required when:
-                  #
-                  #   - this is still a prerelease
-                  #   - OR the stable release is not currently Latest
-                  #
-                  if (
-                      matching_release.get(
-                          'prerelease',
-                          False
-                      )
-                      or
-                      latest_release_id
-                      != release_id
-                  ):
-                      promote = True
-
-              else:
-                  #
-                  # No equivalent validated kernel exists.
-                  #
-                  # A real build is required.
-                  #
-                  changed = True
-
-          with open(
-              e['GITHUB_OUTPUT'],
-              'a'
-          ) as output:
-              output.write(
-                  f"tag={selected_tag}\n"
-                  f"changed={str(changed).lower()}\n"
-                  f"promote={str(promote).lower()}\n"
-                  f"release_id={release_id}\n"
-              )
-
-          with open(
-              e['GITHUB_STEP_SUMMARY'],
-              'a'
-          ) as summary:
-
-              summary.write(
-                  f"Candidate: "
-                  f"`{selected_tag}`\n\n"
-              )
-
-              if changed:
-                  summary.write(
-                      "Macmini8,1 build inputs changed: "
-                      "build required.\n"
-                  )
-
-              elif promote:
-                  summary.write(
-                      "Identical validated kernel already "
-                      "exists. It will be promoted/repaired "
-                      "as the stable Latest release without "
-                      "recompilation.\n"
-                  )
-
-              else:
-                  summary.write(
-                      "Exact validated Macmini8,1 kernel "
-                      "already exists and is the stable "
-                      "Latest release: compilation skipped.\n"
-                  )
-          PY
-
-      - name: Test T2 patch application
-        if: steps.candidate.outputs.changed == 'true'
         id: compat
         shell: bash
         env:
@@ -391,20 +79,132 @@ jobs:
         run: |
           bash scripts/validate-patches.sh
 
+      - name: Validate T2 integration inputs
+        if: steps.pve.outputs.status == 'resolved'
+        id: config
+        shell: bash
+        run: |
+          bash scripts/validate-config.sh
+
+      - name: Wait for T2 compatibility
+        if: steps.pve.outputs.status == 'resolved' && steps.compat.outputs.compatible == 'false'
+        shell: bash
+        run: |
+          echo "::notice title=Waiting for T2 compatibility::Proxmox ${{ steps.pve_repo.outputs.kernel }} is not compatible with the reviewed Macmini8,1 patch profile. Failed patch: ${{ steps.compat.outputs.failed_patch }}. No build or release will be performed; the scheduled workflow will retry."
+
+      - name: Check whether this exact Macmini8,1 build is already published
+        if: steps.pve.outputs.status == 'resolved' && steps.compat.outputs.compatible == 'true'
+        id: candidate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PVE_SHA: ${{ steps.pve.outputs.sha }}
+          T2_PATCHSET_SHA: ${{ steps.compat.outputs.patchset_sha }}
+          KERNEL_VERSION: ${{ steps.pve_repo.outputs.kernel }}
+          PACKAGE_VERSION: ${{ steps.pve_repo.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          RECIPE="$(
+            git rev-parse \
+              HEAD:scripts \
+              HEAD:.github/workflows/build.yml
+          )"
+
+          IDENTITY="$(
+            printf '%s\n%s\n%s\n%s\n' \
+              "${PVE_SHA}" \
+              "${T2_PATCHSET_SHA}" \
+              "${PACKAGE_VERSION}" \
+              "${RECIPE}"
+          )"
+
+          DIGEST="$(
+            printf '%s' "${IDENTITY}" |
+              sha256sum |
+              awk '{print $1}'
+          )"
+
+          TAG="auto-${KERNEL_VERSION}-pve-t2-${DIGEST}"
+
+          STATUS="$(
+            curl \
+              --silent \
+              --show-error \
+              --output release.json \
+              --write-out '%{http_code}' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/${GH_REPO}/releases/tags/${TAG}"
+          )"
+
+          CHANGED=false
+          PROMOTE=false
+          RELEASE_ID=""
+
+          case "${STATUS}" in
+            200)
+              RELEASE_ID="$(jq -r '.id' release.json)"
+
+              if [[ "$(jq -r '.draft' release.json)" == true ]]; then
+                CHANGED=true
+              elif [[ "$(jq -r '.prerelease' release.json)" == true ]]; then
+                PROMOTE=true
+              else
+                LATEST_ID="$(
+                  gh api \
+                    "repos/${GH_REPO}/releases/latest" \
+                    --jq '.id' \
+                    2>/dev/null || true
+                )"
+
+                if [[ "${LATEST_ID}" != "${RELEASE_ID}" ]]; then
+                  PROMOTE=true
+                fi
+              fi
+              ;;
+
+            404)
+              CHANGED=true
+              ;;
+
+            *)
+              echo "ERROR: release lookup returned HTTP ${STATUS}"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "tag=${TAG}"
+            echo "changed=${CHANGED}"
+            echo "promote=${PROMOTE}"
+            echo "release_id=${RELEASE_ID}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo
+            echo "## Release candidate"
+            echo "- Tag: \`${TAG}\`"
+            echo "- Build required: \`${CHANGED}\`"
+            echo "- Promotion/Latest repair required: \`${PROMOTE}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
       - name: Prepare T2 build tree for Macmini8,1
-        if: steps.candidate.outputs.changed == 'true'
+        if: steps.compat.outputs.compatible == 'true' && steps.candidate.outputs.changed == 'true'
         id: integrate
         shell: bash
         env:
           PVE_SHA: ${{ steps.pve.outputs.sha }}
           T2_SHA: ${{ steps.t2.outputs.sha }}
           EXPECTED_PATCH_COUNT: ${{ steps.compat.outputs.patch_count }}
-          EXPECTED_PATCHSET_SHA: ${{ steps.t2.outputs.patchset_sha }}
+          EXPECTED_PATCHSET_SHA: ${{ steps.compat.outputs.patchset_sha }}
         run: |
           bash scripts/prepare-integration.sh
 
       - name: Build Macmini8,1 T2 kernel
-        if: steps.candidate.outputs.changed == 'true'
+        if: steps.compat.outputs.compatible == 'true' && steps.candidate.outputs.changed == 'true'
         id: build
         shell: bash
         run: |
@@ -588,7 +388,7 @@ jobs:
             '
 
       - name: Validate generated T2 packages
-        if: steps.candidate.outputs.changed == 'true'
+        if: steps.compat.outputs.compatible == 'true' && steps.candidate.outputs.changed == 'true'
         id: packages
         shell: bash
         env:
@@ -598,7 +398,7 @@ jobs:
           bash scripts/validate-packages.sh
 
       - name: Upload T2 kernel artifacts
-        if: steps.candidate.outputs.changed == 'true'
+        if: steps.compat.outputs.compatible == 'true' && steps.candidate.outputs.changed == 'true'
         id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -612,56 +412,65 @@ jobs:
           retention-days: 7
 
       - name: Write build summary
-        if: always() && steps.pve.outputs.status == 'resolved'
+        if: always()
         shell: bash
         run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF_SUMMARY'
+          if [[ "${{ steps.pve.outputs.status }}" == "pending" ]]; then
+            STATE="WAITING_FOR_PROXMOX_SOURCE"
+          elif [[ "${{ steps.compat.outputs.compatible }}" == "false" ]]; then
+            STATE="WAITING_FOR_COMPATIBILITY"
+          elif [[ "${{ steps.candidate.outputs.changed }}" == "true" ]]; then
+            STATE="BUILD_REQUIRED"
+          elif [[ "${{ steps.candidate.outputs.promote }}" == "true" ]]; then
+            STATE="PROMOTION_REQUIRED"
+          elif [[ "${{ steps.compat.outputs.compatible }}" == "true" ]]; then
+            STATE="UP_TO_DATE"
+          else
+            STATE="UNKNOWN"
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF_SUMMARY
           # T2 kernel workflow
 
+          ## State
+          **${STATE}**
+
           ## Target
-          - Hardware: `Macmini8,1`
-          - Profile: `AppleSMC / thermal sensors / fan support only`
+          - Hardware: \`Macmini8,1\`
+          - Profile: \`AppleSMC / thermal sensors / fan support only\`
 
           ## Published Proxmox kernel
-          - Repository: `pve-no-subscription`
-          - Package: `${{ steps.pve_repo.outputs.package }}`
-          - Kernel: `${{ steps.pve_repo.outputs.kernel }}`
-          - Package version: `${{ steps.pve_repo.outputs.version }}`
+          - Package: \`${{ steps.pve_repo.outputs.package }}\`
+          - Kernel: \`${{ steps.pve_repo.outputs.kernel }}\`
+          - Package version: \`${{ steps.pve_repo.outputs.version }}\`
 
           ## Proxmox source
-          - Status: `${{ steps.pve.outputs.status }}`
-          - Repository: `${{ steps.pve.outputs.repository }}`
-          - SHA: `${{ steps.pve.outputs.sha }}`
-          - Commit: `${{ steps.pve.outputs.subject }}`
-          - Debian changelog: `${{ steps.pve.outputs.changelog }}`
+          - Status: \`${{ steps.pve.outputs.status }}\`
+          - SHA: \`${{ steps.pve.outputs.sha }}\`
+          - Commit: \`${{ steps.pve.outputs.subject }}\`
 
           ## T2 source
-          - Source SHA: `${{ steps.t2.outputs.sha }}`
-          - Kernel target: `${{ steps.t2.outputs.kver }}`
-          - Commit: `${{ steps.t2.outputs.subject }}`
-          - Macmini8,1 patchset SHA256: `${{ steps.t2.outputs.patchset_sha }}`
-          - Allowlisted patches: `${{ steps.t2.outputs.profile_patch_count }}`
-          - Potential new patches requiring review: `${{ steps.t2.outputs.review_count }}`
-          - Review candidates: `${{ steps.t2.outputs.review_patches }}`
+          - Source SHA: \`${{ steps.t2.outputs.sha }}\`
+          - Kernel target: \`${{ steps.t2.outputs.kver }}\`
+          - Upstream patchset SHA256: \`${{ steps.t2.outputs.patchset_sha }}\`
 
           ## Compatibility
-          - Baseline compatible: `${{ steps.compat.outputs.compatible }}`
-          - T2 patches applied: `${{ steps.compat.outputs.patch_count }}`
-          - T2 patches skipped: `${{ steps.compat.outputs.skipped_count }}`
-          - Failed patch: `${{ steps.compat.outputs.failed_patch }}`
+          - Compatible: \`${{ steps.compat.outputs.compatible }}\`
+          - Failed patch: \`${{ steps.compat.outputs.failed_patch }}\`
+          - Reviewed compatibility replacements: \`${{ steps.compat.outputs.compat_overrides }}\`
+          - Effective patchset SHA256: \`${{ steps.compat.outputs.patchset_sha }}\`
 
           ## Result
-          - Build required: `${{ steps.candidate.outputs.changed }}`
-          - Existing release promotion/repair: `${{ steps.candidate.outputs.promote }}`
-          - Kernel build: `${{ steps.build.outcome }}`
-          - Package validation: `${{ steps.packages.outcome }}`
-          - Artifact upload: `${{ steps.upload.outcome }}`
+          - Build required: \`${{ steps.candidate.outputs.changed }}\`
+          - Kernel build: \`${{ steps.build.outcome }}\`
+          - Package validation: \`${{ steps.packages.outcome }}\`
+          - Artifact upload: \`${{ steps.upload.outcome }}\`
           EOF_SUMMARY
 
   promote:
     name: Promote existing validated release
     needs: discover
-    if: needs.discover.outputs.promote == 'true'
+    if: needs.discover.outputs.promote == 'true' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     permissions:
@@ -679,14 +488,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ -z "${RELEASE_ID}" ]]; then
+          [[ -n "${RELEASE_ID}" ]] || {
             echo "ERROR: release ID is empty"
             exit 1
-          fi
-
-          echo "Promoting/repairing existing validated release:"
-          echo "Tag: ${RELEASE_TAG}"
-          echo "ID:  ${RELEASE_ID}"
+          }
 
           gh api \
             --method PATCH \
@@ -696,23 +501,8 @@ jobs:
             -f make_latest=true \
             > promoted-release.json
 
-          if [[ "$(
-            jq -r '.draft' \
-              promoted-release.json
-          )" != false ]]
-          then
-            echo "ERROR: release is still a draft"
-            exit 1
-          fi
-
-          if [[ "$(
-            jq -r '.prerelease' \
-              promoted-release.json
-          )" != false ]]
-          then
-            echo "ERROR: release is still marked as prerelease"
-            exit 1
-          fi
+          [[ "$(jq -r '.draft' promoted-release.json)" == false ]]
+          [[ "$(jq -r '.prerelease' promoted-release.json)" == false ]]
 
           LATEST_ID="$(
             gh api \
@@ -720,23 +510,15 @@ jobs:
               --jq '.id'
           )"
 
-          if [[ "${LATEST_ID}" != "${RELEASE_ID}" ]]; then
+          [[ "${LATEST_ID}" == "${RELEASE_ID}" ]] || {
             echo "ERROR: promoted release was not marked as Latest"
-            echo "Expected ID: ${RELEASE_ID}"
-            echo "Latest ID:   ${LATEST_ID}"
             exit 1
-          fi
-
-          printf \
-            'Promoted stable Latest release: https://github.com/%s/releases/tag/%s\n' \
-            "${GH_REPO}" \
-            "${RELEASE_TAG}" \
-            >> "${GITHUB_STEP_SUMMARY}"
+          }
 
   publish:
     name: Publish validated kernel release
     needs: discover
-    if: needs.discover.outputs.changed == 'true'
+    if: needs.discover.outputs.changed == 'true' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -751,7 +533,9 @@ jobs:
       KERNEL_VERSION: ${{ needs.discover.outputs.kernel }}
       PVE_SHA: ${{ needs.discover.outputs.pve_sha }}
       T2_SHA: ${{ needs.discover.outputs.t2_sha }}
+      T2_UPSTREAM_PATCHSET_SHA: ${{ needs.discover.outputs.t2_upstream_patchset_sha }}
       T2_PATCHSET_SHA: ${{ needs.discover.outputs.t2_patchset_sha }}
+      T2_COMPAT_OVERRIDES: ${{ needs.discover.outputs.compat_overrides }}
 
     steps:
       - name: Download validated packages from this run
@@ -763,193 +547,59 @@ jobs:
             --name "pve-t2-${KERNEL_VERSION}-macmini8-1" \
             --dir release-assets
 
-      - name: Verify packages and prepare portable checksums
+      - name: Verify packages and prepare release notes
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
-          import hashlib
-          import os
-          import pathlib
-          import re
-          import subprocess
+          cd release-assets
 
-          root = pathlib.Path(
-              'release-assets'
+          mapfile -t DEBS < <(
+            find . -maxdepth 1 -type f -name '*.deb' -printf '%f\n' | sort
           )
 
-          files = list(
-              root.iterdir()
-          )
+          [[ "${#DEBS[@]}" -eq 2 ]] || {
+            echo "ERROR: expected exactly kernel and headers packages"
+            exit 1
+          }
 
-          assert (
-              len(files) == 3
-              and all(
-                  p.is_file()
-                  for p in files
-              )
-          ), 'Expected exactly three files'
+          sha256sum -c SHA256SUMS
 
-          kernel = list(
-              root.glob(
-                  'proxmox-kernel-*-pve-t2_*.deb'
-              )
-          )
+          for DEB in "${DEBS[@]}"; do
+            dpkg-deb -W \
+              --showformat='${Package}\t${Version}\t${Architecture}\n' \
+              "${DEB}"
+          done
 
-          headers = list(
-              root.glob(
-                  'proxmox-headers-*-pve-t2_*.deb'
-              )
-          )
+          cd ..
 
-          assert (
-              len(kernel) == 1
-              and len(headers) == 1
-          ), 'Expected kernel and headers'
+          cat > release-notes.md <<EOF_NOTES
+          Proxmox kernel ${KERNEL_VERSION}-pve-t2 for Macmini8,1
 
-          packages = (
-              kernel
-              + headers
-          )
+          Automatically compiled and package-validated. Hardware boot, thermal
+          sensors and fan operation have NOT been validated by GitHub Actions.
 
-          sums = (
-              root
-              / 'SHA256SUMS'
-          )
+          Profile: AppleSMC / thermal sensors / fan support only; not the
+          complete T2 patchset.
 
-          expected = {}
+          Proxmox source: ${PVE_SHA}
 
-          for line in sums.read_text().splitlines():
-              digest, name = line.split(
-                  maxsplit=1
-              )
+          T2 source revision: ${T2_SHA}
 
-              name = pathlib.PurePosixPath(
-                  name
-              ).name
+          Upstream Macmini8,1 patchset SHA256: ${T2_UPSTREAM_PATCHSET_SHA}
 
-              assert (
-                  re.fullmatch(
-                      r'[0-9a-f]{64}',
-                      digest
-                  )
-                  and
-                  name not in expected
-              )
+          Effective Macmini8,1 patchset SHA256: ${T2_PATCHSET_SHA}
 
-              expected[name] = digest
+          Reviewed compatibility replacements: ${T2_COMPAT_OVERRIDES:-none}
 
-          assert (
-              set(expected)
-              ==
-              {
-                  p.name
-                  for p in packages
-              }
-          ), 'Invalid checksum coverage'
+          Build recipe commit: ${GITHUB_SHA}
 
-          versions = []
+          Build: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
 
-          for p, prefix in zip(
-              packages,
-              [
-                  'proxmox-kernel-',
-                  'proxmox-headers-'
-              ]
-          ):
-
-              actual_digest = hashlib.sha256(
-                  p.read_bytes()
-              ).hexdigest()
-
-              assert (
-                  actual_digest
-                  ==
-                  expected[p.name]
-              ), 'Checksum mismatch'
-
-              name, version, arch = (
-                  subprocess.check_output(
-                      [
-                          'dpkg-deb',
-                          '-W',
-                          '--showformat=${Package}\t${Version}\t${Architecture}',
-                          str(p)
-                      ],
-                      text=True
-                  ).split('\t')
-              )
-
-              assert (
-                  name
-                  ==
-                  prefix
-                  + os.environ[
-                      'KERNEL_VERSION'
-                  ]
-                  + '-pve-t2'
-              )
-
-              assert arch == 'amd64'
-
-              versions.append(
-                  version
-              )
-
-          assert (
-              versions[0]
-              ==
-              versions[1]
-          ), 'Kernel/header version mismatch'
-
-          sums.write_text(
-              ''.join(
-                  f"{expected[p.name]}  "
-                  f"{p.name}\n"
-                  for p in packages
-              )
-          )
-
-          e = os.environ
-
-          pathlib.Path(
-              'release-notes.md'
-          ).write_text(
-              f"Proxmox kernel "
-              f"{e['KERNEL_VERSION']}-pve-t2 "
-              f"for Macmini8,1\n\n"
-
-              "Automatically compiled and package-validated. "
-              "Hardware boot, thermal sensors and fan operation "
-              "have NOT been validated by this workflow.\n\n"
-
-              "Profile: AppleSMC / thermal sensors / fan support only; "
-              "not the complete T2 patchset.\n\n"
-
-              f"Proxmox source: "
-              f"{e['PVE_SHA']}\n\n"
-
-              f"T2 source revision: "
-              f"{e['T2_SHA']}\n\n"
-
-              f"Macmini8,1 T2 patchset SHA256: "
-              f"{e['T2_PATCHSET_SHA']}\n\n"
-
-              f"Build recipe commit: "
-              f"{e['GITHUB_SHA']}\n\n"
-
-              f"Build: "
-              f"https://github.com/"
-              f"{e['GITHUB_REPOSITORY']}"
-              f"/actions/runs/"
-              f"{e['GITHUB_RUN_ID']}\n\n"
-
-              "Assets: kernel, matching headers and SHA256SUMS. "
-              "Verify with `sha256sum -c SHA256SUMS`. "
-              "Keep a working kernel for rollback.\n"
-          )
-          PY
+          Assets: kernel, matching headers and SHA256SUMS.
+          Verify with: sha256sum -c SHA256SUMS
+          Keep a working kernel for rollback.
+          EOF_NOTES
 
       - name: Stage assets then publish release
         shell: bash
@@ -968,23 +618,14 @@ jobs:
           )"
 
           case "${STATUS}" in
-
             200)
-              if [[ "$(
-                jq -r '.draft' \
-                  release.json
-              )" != true ]]
-              then
-                echo "This release is already published; keeping existing assets."
+              if [[ "$(jq -r '.draft' release.json)" != true ]]; then
+                echo "Release already published; keeping existing assets."
                 exit 0
               fi
               ;;
 
             404)
-              #
-              # Create a normal release as a draft.
-              # It is intentionally NOT marked as prerelease.
-              #
               gh release create \
                 "${RELEASE_TAG}" \
                 --draft \
@@ -998,7 +639,6 @@ jobs:
               echo "ERROR: release lookup returned HTTP ${STATUS}"
               exit 1
               ;;
-
           esac
 
           gh release upload \
@@ -1006,21 +646,11 @@ jobs:
             release-assets/* \
             --clobber
 
-          #
-          # Publish the validated draft as a normal release
-          # and explicitly make it GitHub Latest.
-          #
-
           gh release edit \
             "${RELEASE_TAG}" \
             --draft=false \
             --latest \
             --notes-file release-notes.md
-
-          #
-          # Verify that GitHub really exposes this release
-          # as Latest.
-          #
 
           RELEASE_ID="$(
             gh api \
@@ -1034,15 +664,7 @@ jobs:
               --jq '.id'
           )"
 
-          if [[ "${RELEASE_ID}" != "${LATEST_ID}" ]]; then
+          [[ "${RELEASE_ID}" == "${LATEST_ID}" ]] || {
             echo "ERROR: published release is not GitHub Latest"
-            echo "Published ID: ${RELEASE_ID}"
-            echo "Latest ID:    ${LATEST_ID}"
             exit 1
-          fi
-
-          printf \
-            'Published stable Latest release: https://github.com/%s/releases/tag/%s\n' \
-            "${GH_REPO}" \
-            "${RELEASE_TAG}" \
-            >> "${GITHUB_STEP_SUMMARY}"
+          }
