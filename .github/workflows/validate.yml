@@ -82,7 +82,7 @@ jobs:
         if: steps.pve.outputs.status == 'resolved' && steps.compat.outputs.compatible == 'false'
         shell: bash
         run: |
-          echo "::warning title=T2 compatibility blocked::Patch ${{ steps.compat.outputs.failed_patch }} requires manual review. No build integration was performed."
+          echo "::warning title=T2 compatibility blocked::Patch ${{ steps.compat.outputs.failed_patch }} requires manual review."
 
       - name: Write validation summary
         if: always()
