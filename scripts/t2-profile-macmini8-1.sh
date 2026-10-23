@@ -40,6 +40,7 @@ MACMINI_T2_PATCHES=(
 MACMINI_T2_REVIEWED_IGNORED_PATCHES=(
   "3007-applesmc-Add-iMacPro-to-applesmc_whitelist.patch"
   "3009-applesmc-battery-charge-limiter.patch"
+  "4001-asahi-trackpad.patch"
 )
 
 # Reviewed local compatibility overrides.
