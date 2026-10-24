@@ -563,6 +563,7 @@ jobs:
             exit 1
           }
 
+          sed -i 's#  proxmox-pve-kernel/#  #' SHA256SUMS
           sha256sum -c SHA256SUMS
 
           for DEB in "${DEBS[@]}"; do
